@@ -1,16 +1,21 @@
 // =============================================================================
-// LowLoadNdiOutput.cs（Warudo Playground プラグイン）
+// LowLoadNdiOutput.cs（Warudo Playground プラグイン＋アセット）
 //
-// 内蔵の「NDI出力」の代わりに、Warudo のメイン出力の映像を NDI で送る。
+// 内蔵の「NDI出力」の代わりに、Warudo の映像を NDI で送る。
 // 内蔵（KlakNDI の NdiSender、Texture モード）は毎フレーム GPU で変換・読み戻しをするので、
 // Warudo の fps が高いほど重くなる。こちらは送信 fps のタイミングでだけ読み戻し、
 // NDI への送信は別スレッドで行うので、描画ループを待たせない。
 //
-// 流れ：
+//   LowLoadNdiPlugin       … 設定ページ。メイン出力（CopyOutputToTexture.OutputTexture、内蔵 NDI と同じ映像）を送る
+//   LowLoadNdiCameraAsset  … シーンに置くアセット。指定したカメラの映像（Camera.targetTexture）を送る。
+//                            カメラは、メインカメラか、Spout／NDI／仮想カメラ出力がオンのときしか Warudo が描画しない
+//                            （CameraAsset.ShouldRender）。描画されていないカメラは、送信するフレームだけ自分で描画させる
+//   NdiPipeline            … 両方が使う送信の部品
+//
+// 送信の流れ（NdiPipeline）：
 //   描画ループ（OnEndOfFrame。描画が終わったあとなので、そのフレームの映像を取れる）
-//     送信の時刻（半フレーム分の余裕つき）になったら CopyOutputToTexture.OutputTexture（内蔵 NDI と同じ映像）を
-//     上下反転して BGRA の作業用テクスチャへ Blit し、自分のバッファ（NativeArray）へ直接
-//     読み戻すよう AsyncGPUReadback.RequestIntoNativeArray で依頼する（待たない）
+//     送信の時刻（半フレーム分の余裕つき）になったら、映像を上下反転して BGRA の作業用テクスチャへ Blit し、
+//     自分のバッファ（NativeArray）へ直接読み戻すよう AsyncGPUReadback.RequestIntoNativeArray で依頼する（待たない）
 //   読み戻しの完了（メインスレッドのコールバック）
 //     コピーはせず、そのバッファを送信スレッドへ渡すだけ
 //   送信スレッド
@@ -21,7 +26,7 @@
 // NDI は Warudo 同梱の Processing.NDI.Lib.x64.dll を DllImport で直接呼ぶ。
 //
 // 置き場所：Warudo_Data/StreamingAssets/Playground/LowLoadNdi/
-// マスター：B:\Unity\Warudo SDK 0.14.3.5 Modding Project\Playground\LowLoadNdi\
+// マスター：B:\Git\WarudoMod-LowLoadNDI\Playground\
 // =============================================================================
 
 using System;
@@ -39,28 +44,30 @@ using UnityEngine.Rendering;
 using Warudo.Core;
 using Warudo.Core.Attributes;
 using Warudo.Core.Plugins;
+using Warudo.Core.Scenes;
 using Warudo.Plugins.Core;
+using Warudo.Plugins.Core.Assets.Cinematography;
 using Warudo.Plugins.Core.Mixins;
 using Warudo.Plugins.Core.Utils;
 using Debug = UnityEngine.Debug;
 
 namespace Rune.LowLoadNdi {
 
+    // ───────── メイン出力（設定ページ）─────────
+
     [PluginType(
         Id = "runechaan.lowloadndi",
         Name = "Low-Load NDI Output",
         Description = "Sends the main output over NDI at its own frame rate without stalling the render loop.",
-        Version = "0.2.2",
+        Version = "0.3.0",
         Author = "RUNE.",
         AssetTypes = new Type[] { },
         NodeTypes = new Type[] { })]
     public class LowLoadNdiPlugin : Plugin {
 
-        // ───────── 設定 ─────────
-
         [DataInput]
         [Label("有効")]
-        [Description("送信の開始と停止。使うときは、設定の内蔵「NDI出力」を「いいえ」にする。")]
+        [Description("送信の開始と停止。使うときは、設定の内蔵「NDI出力」を「いいえ」にする。カメラごとの出力は、アセット「Low-Load NDI カメラ出力」を置く。")]
         public bool OutputEnabled = false;
 
         [DataInput]
@@ -94,7 +101,238 @@ namespace Rune.LowLoadNdi {
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">" +
             "<rect x=\"2\" y=\"5\" width=\"14\" height=\"14\" rx=\"2\"/><path d=\"M16 10l6-3v10l-6-3z\"/></svg>";
 
-        // ───────── 内部の状態 ─────────
+        readonly NdiPipeline pipeline = new NdiPipeline("main");
+        readonly Stopwatch mainWatch = new Stopwatch();
+        long mainTicks;             // この 1 秒にメインスレッドで使った時間
+        int mainFrames;
+        float statusTimer;
+
+        protected override void OnCreate() {
+            base.OnCreate();
+            ToolbarItem.SetEnabled(true);
+            ToolbarItem.SetTooltip("Low-Load NDI Output");
+            ToolbarItem.SetIcon(ToolbarIcon);
+            ToolbarItem.OnTrigger = () => Context.Service.NavigateToPlugin(PluginId, null);
+
+            Watch(nameof(OutputEnabled), ApplyEnabled);
+            Watch(nameof(NdiName), () => { if (pipeline.Running) { pipeline.Stop(); StartOutput(); } });
+            Watch(nameof(SendRate), () => pipeline.Rate = SendRate);
+            Watch(nameof(Alpha), () => pipeline.Alpha = Alpha);
+            Watch(nameof(PauseWithoutReceivers), () => pipeline.PauseWithoutReceivers = PauseWithoutReceivers);
+            pipeline.Rate = SendRate;
+            pipeline.Alpha = Alpha;
+            pipeline.PauseWithoutReceivers = PauseWithoutReceivers;
+            ApplyEnabled();
+            UpdateStatus(0f);
+        }
+
+        protected override void OnDestroy() {
+            pipeline.Stop();
+            base.OnDestroy();
+        }
+
+        // 描画が終わったあと（フレームの終わり）に取り込む。描画の前に取り込むと、ひとつ前のフレームの映像になり 1 フレーム遅れる
+        public override void OnEndOfFrame() {
+            base.OnEndOfFrame();
+            if (!pipeline.Running) return;
+            mainWatch.Restart();
+            var source = CopyOutputToTexture.OutputTexture;
+            if (source != null && pipeline.IsSendFrame()) pipeline.Send(source);
+            mainWatch.Stop();
+            mainTicks += mainWatch.ElapsedTicks;
+        }
+
+        public override void OnPostLateUpdate() {
+            base.OnPostLateUpdate();
+            mainFrames++;
+            statusTimer += Time.unscaledDeltaTime;
+            if (statusTimer >= 1f) {
+                // OnCreate だけだとエディターに届かないことがあるので、ドキュメントの例に合わせて送り続ける
+                ToolbarItem.SetEnabled(true);
+                UpdateStatus(statusTimer);
+                statusTimer = 0f;
+            }
+        }
+
+        void ApplyEnabled() {
+            if (OutputEnabled && !pipeline.Running) StartOutput();
+            else if (!OutputEnabled && pipeline.Running) pipeline.Stop();
+        }
+
+        void StartOutput() => pipeline.Start(string.IsNullOrWhiteSpace(NdiName) ? "Warudo LowLoad" : NdiName);
+
+        void UpdateStatus(float elapsed) {
+            var mainUs = mainFrames > 0 ? (mainTicks + pipeline.TakeCallbackTicks()) * 1e6 / Stopwatch.Frequency / mainFrames : 0.0;
+            mainTicks = 0;
+            mainFrames = 0;
+
+            var sb = new StringBuilder();
+            pipeline.AppendStatus(sb, elapsed);
+            if (pipeline.Running) sb.Append($"\n- メインスレッドで使った時間：{mainUs:0.0} µs／フレーム");
+            var core = Context.PluginManager.GetPlugin<CorePlugin>();
+            if (core != null && core.NdiOutput) sb.Append("\n\n**注意**：内蔵の「NDI出力」がオンです。負荷を比べるときは「いいえ」にしてください。");
+
+            var text = sb.ToString();
+            if (text != Status) SetDataInput(nameof(Status), text, true);
+        }
+    }
+
+    // ───────── カメラごとの出力（シーンに置くアセット）─────────
+
+    [AssetType(
+        Id = "46c9c11b-0793-424a-9a2f-1b893a48cb45",
+        Title = "Low-Load NDI カメラ出力",
+        Category = "RUNE.MODS")]
+    public class LowLoadNdiCameraAsset : Asset {
+
+        [DataInput]
+        [Label("有効")]
+        [Description("送信の開始と停止。使うときは、そのカメラの内蔵「NDI出力」を「いいえ」にする。")]
+        public bool Enabled = true;
+
+        [DataInput]
+        [Label("カメラ")]
+        [Description("送るカメラ。メインカメラでないカメラは、送信するフレームだけ描画させる。")]
+        public CameraAsset SourceCamera;
+
+        [DataInput]
+        [Label("NDI名")]
+        [Description("受信側に表示される名前。空なら「Warudo LowLoad - カメラ名」。")]
+        public string NdiName = "";
+
+        [DataInput]
+        [Label("送信fps")]
+        [Description("NDI へ送る回数（毎秒）。描画されていないカメラは、この回数だけ描画する。")]
+        public NdiFrameRate SendRate = NdiFrameRate.Fps30;
+
+        [DataInput]
+        [Label("アルファ")]
+        [Description("透過背景のときに使う。いいえなら BGRX（アルファなし）で送る。")]
+        public bool Alpha = false;
+
+        [DataInput]
+        [Label("受信者がいないときは止める")]
+        [Description("受信者が 0 のあいだは、描画も読み戻しもしない。")]
+        public bool PauseWithoutReceivers = true;
+
+        [Markdown]
+        public string Status = "";
+
+        readonly NdiPipeline pipeline = new NdiPipeline("camera");
+        readonly Stopwatch mainWatch = new Stopwatch();
+        long mainTicks;
+        long renderTicks;           // そのうち、カメラを自分で描画させた時間
+        int mainFrames;
+        int selfRenderCount;        // この 1 秒に自分で描画させた回数
+        float statusTimer;
+
+        protected override void OnCreate() {
+            base.OnCreate();
+            Watch(nameof(Enabled), Apply);
+            Watch(nameof(SourceCamera), Restart);
+            Watch(nameof(NdiName), Restart);
+            Watch(nameof(SendRate), () => pipeline.Rate = SendRate);
+            Watch(nameof(Alpha), () => pipeline.Alpha = Alpha);
+            Watch(nameof(PauseWithoutReceivers), () => pipeline.PauseWithoutReceivers = PauseWithoutReceivers);
+            pipeline.Rate = SendRate;
+            pipeline.Alpha = Alpha;
+            pipeline.PauseWithoutReceivers = PauseWithoutReceivers;
+            Apply();
+            UpdateStatus(0f);
+        }
+
+        protected override void OnDestroy() {
+            pipeline.Stop();
+            base.OnDestroy();
+        }
+
+        string OutputName() {
+            if (!string.IsNullOrWhiteSpace(NdiName)) return NdiName;
+            return "Warudo LowLoad - " + (SourceCamera != null ? SourceCamera.Name : "Camera");
+        }
+
+        void Apply() {
+            var want = Enabled && SourceCamera != null;
+            if (want && !pipeline.Running) pipeline.Start(OutputName());
+            else if (!want && pipeline.Running) pipeline.Stop();
+            SetActive(SourceCamera != null);
+        }
+
+        void Restart() {
+            if (pipeline.Running) pipeline.Stop();
+            Apply();
+        }
+
+        public override void OnEndOfFrame() {
+            base.OnEndOfFrame();
+            if (!pipeline.Running) return;
+            var camera = SourceCamera != null ? SourceCamera.Camera : null;
+            if (camera == null || camera.targetTexture == null) return;
+
+            mainWatch.Restart();
+            if (pipeline.IsSendFrame()) {
+                // Warudo が描画していないカメラ（CameraAsset.ShouldRender が false）は、送るフレームだけ自分で描画させる。
+                // フレームの終わりの時点で enabled なら、このフレームはもう描画されている
+                if (!camera.enabled && GraphicsSettings.currentRenderPipeline == null) {
+                    var renderStart = mainWatch.ElapsedTicks;
+                    camera.Render();
+                    renderTicks += mainWatch.ElapsedTicks - renderStart;
+                    selfRenderCount++;
+                }
+                pipeline.Send(camera.targetTexture);
+            }
+            mainWatch.Stop();
+            mainTicks += mainWatch.ElapsedTicks;
+        }
+
+        public override void OnPostLateUpdate() {
+            base.OnPostLateUpdate();
+            mainFrames++;
+            statusTimer += Time.unscaledDeltaTime;
+            if (statusTimer >= 1f) {
+                UpdateStatus(statusTimer);
+                statusTimer = 0f;
+            }
+        }
+
+        void UpdateStatus(float elapsed) {
+            var perFrame = mainFrames > 0 ? 1e6 / Stopwatch.Frequency / mainFrames : 0.0;
+            var mainUs = (mainTicks + pipeline.TakeCallbackTicks()) * perFrame;
+            var renderUs = renderTicks * perFrame;
+            var renders = elapsed > 0f ? selfRenderCount / elapsed : 0f;
+            mainTicks = 0;
+            renderTicks = 0;
+            mainFrames = 0;
+            selfRenderCount = 0;
+
+            var sb = new StringBuilder();
+            if (SourceCamera == null) {
+                sb.Append("カメラを選んでください");
+            } else {
+                pipeline.AppendStatus(sb, elapsed);
+                if (pipeline.Running) {
+                    var camera = SourceCamera.Camera;
+                    if (camera != null && camera.enabled) {
+                        sb.Append("\n- 描画：Warudo が毎フレーム描画しています（メインカメラ、または内蔵の出力がオン）");
+                    } else if (GraphicsSettings.currentRenderPipeline != null) {
+                        sb.Append("\n- 描画：**URP では自分で描画させられません**。メインカメラのときだけ映像が更新されます");
+                    } else {
+                        sb.Append($"\n- 描画：送るフレームだけ描画させています（{renders:0.00} 回／秒）");
+                    }
+                    sb.Append($"\n- メインスレッドで使った時間：{mainUs:0.0} µs／フレーム（うちカメラの描画 {renderUs:0.0} µs）");
+                }
+                if (SourceCamera.NdiOutput) sb.Append("\n\n**注意**：このカメラの内蔵「NDI出力」がオンです。そのカメラが毎フレーム描画・読み戻しされるので、「いいえ」にしてください。");
+            }
+
+            var text = sb.ToString();
+            if (text != Status) SetDataInput(nameof(Status), text, true);
+        }
+    }
+
+    // ───────── 送信の部品 ─────────
+
+    // 1 つの NDI 送信。メインスレッドから Start／IsSendFrame／Send／Stop を呼ぶ。
+    sealed class NdiPipeline {
 
         const int SlotCount = 3;
 
@@ -111,6 +349,7 @@ namespace Rune.LowLoadNdi {
             public volatile bool Stop;
         }
 
+        readonly string logName;
         bool running;
         IntPtr sendInstance = IntPtr.Zero;
         Thread worker;
@@ -126,6 +365,7 @@ namespace Rune.LowLoadNdi {
 
         double nextSendTime;
         double averageFrameTime;    // 描画 1 フレームの時間（ならした値）。送信の時刻の判定の余裕に使う
+        NdiFrameRate rate = NdiFrameRate.Fps59_94;
 
         // 送信スレッドが読む値（メインスレッドが書く）
         volatile bool alphaFlag;
@@ -134,85 +374,45 @@ namespace Rune.LowLoadNdi {
         // 状態表示用
         volatile int connections = -1;
         int sentCount;              // Interlocked
+        int lastSentCount;
         int droppedCount;
         volatile string lastError;
-        float statusTimer;
-        int lastSentCount;
-        readonly Stopwatch mainWatch = new Stopwatch();
-        long mainTicks;             // この 1 秒にメインスレッドで使った時間
-        int mainFrames;
+        readonly Stopwatch callbackWatch = new Stopwatch();
+        long callbackTicks;         // 読み戻し完了のコールバックでメインスレッドが使った時間
 
-        // ───────── ライフサイクル ─────────
-
-        protected override void OnCreate() {
-            base.OnCreate();
-            ToolbarItem.SetEnabled(true);
-            ToolbarItem.SetTooltip("Low-Load NDI Output");
-            ToolbarItem.SetIcon(ToolbarIcon);
-            ToolbarItem.OnTrigger = () => Context.Service.NavigateToPlugin(PluginId, null);
-
-            Watch(nameof(OutputEnabled), ApplyEnabled);
-            Watch(nameof(NdiName), () => { if (running) { StopOutput(); StartOutput(); } });
-            Watch(nameof(SendRate), UpdateFrameRate);
-            Watch(nameof(Alpha), () => alphaFlag = Alpha);
-            UpdateFrameRate();
-            alphaFlag = Alpha;
-            ApplyEnabled();
-            UpdateStatus(0f);
+        public NdiPipeline(string logName) {
+            this.logName = logName;
         }
 
-        protected override void OnDestroy() {
-            StopOutput();
-            base.OnDestroy();
-        }
+        public bool Running => running;
+        public bool PauseWithoutReceivers { get; set; } = true;
+        public bool Alpha { get => alphaFlag; set => alphaFlag = value; }
 
-        // 描画が終わったあと（フレームの終わり）に取り込む。描画の前に取り込むと、ひとつ前のフレームの映像になり 1 フレーム遅れる
-        public override void OnEndOfFrame() {
-            base.OnEndOfFrame();
-            if (running) {
-                mainWatch.Restart();
-                Tick();
-                mainWatch.Stop();
-                mainTicks += mainWatch.ElapsedTicks;
+        public NdiFrameRate Rate {
+            get => rate;
+            set {
+                rate = value;
+                value.Fraction(out var n, out var d);
+                frameRateN = n;
+                frameRateD = d;
             }
         }
 
-        public override void OnPostLateUpdate() {
-            base.OnPostLateUpdate();
-            mainFrames++;
-
-            var dt = (double)Time.unscaledDeltaTime;
-            averageFrameTime = averageFrameTime <= 0.0 ? dt : averageFrameTime + (dt - averageFrameTime) * 0.1;
-
-            statusTimer += Time.unscaledDeltaTime;
-            if (statusTimer >= 1f) {
-                // OnCreate だけだとエディターに届かないことがあるので、ドキュメントの例に合わせて送り続ける
-                ToolbarItem.SetEnabled(true);
-                UpdateStatus(statusTimer);
-                statusTimer = 0f;
-            }
+        public long TakeCallbackTicks() {
+            var t = callbackTicks;
+            callbackTicks = 0;
+            return t;
         }
 
-        void ApplyEnabled() {
-            if (OutputEnabled && !running) StartOutput();
-            else if (!OutputEnabled && running) StopOutput();
-        }
+        // ───── 開始と停止 ─────
 
-        void UpdateFrameRate() {
-            SendRate.Fraction(out var n, out var d);
-            frameRateN = n;
-            frameRateD = d;
-        }
-
-        // ───────── 開始と停止 ─────────
-
-        void StartOutput() {
+        public void Start(string ndiName) {
             lastError = null;
             try {
                 NativePointer.Of(default);   // DynamicMethod が使えない環境なら、ここで分かる
             } catch (Exception e) {
                 lastError = "バッファのポインターを取れませんでした：" + (e.InnerException ?? e).Message;
-                Debug.LogError("[LowLoadNdi] " + e);
+                Debug.LogError($"[LowLoadNdi:{logName}] {e}");
                 return;
             }
             try {
@@ -221,7 +421,7 @@ namespace Rune.LowLoadNdi {
                     return;
                 }
                 var settings = new Ndi.SendCreate {
-                    NdiName = string.IsNullOrWhiteSpace(NdiName) ? "Warudo LowLoad" : NdiName,
+                    NdiName = ndiName,
                     Groups = null,
                     ClockVideo = false,   // 間隔はこちらで決めるので、NDI に待たせない
                     ClockAudio = false
@@ -229,7 +429,7 @@ namespace Rune.LowLoadNdi {
                 sendInstance = Ndi.NDIlib_send_create(ref settings);
             } catch (Exception e) {
                 lastError = "NDI を呼べませんでした：" + e.Message;
-                Debug.LogError("[LowLoadNdi] " + e);
+                Debug.LogError($"[LowLoadNdi:{logName}] {e}");
                 sendInstance = IntPtr.Zero;
             }
             if (sendInstance == IntPtr.Zero) {
@@ -241,10 +441,10 @@ namespace Rune.LowLoadNdi {
             nextSendTime = Time.realtimeSinceStartupAsDouble;
             StartWorker();
             running = true;
-            Debug.Log($"[LowLoadNdi] started \"{NdiName}\"");
+            Debug.Log($"[LowLoadNdi:{logName}] started \"{ndiName}\"");
         }
 
-        void StopOutput() {
+        public void Stop() {
             running = false;
             var stopped = StopWorker();
             ReleaseBuffers(stopped);
@@ -252,10 +452,10 @@ namespace Rune.LowLoadNdi {
                 // 送信スレッドが NDI の中で止まったままなら、送信を壊すと落ちるので残す（Warudo を終了すれば片付く）
                 if (stopped) {
                     try { Ndi.NDIlib_send_destroy(sendInstance); }
-                    catch (Exception e) { Debug.LogError("[LowLoadNdi] " + e); }
+                    catch (Exception e) { Debug.LogError($"[LowLoadNdi:{logName}] {e}"); }
                 }
                 sendInstance = IntPtr.Zero;
-                Debug.Log("[LowLoadNdi] stopped");
+                Debug.Log($"[LowLoadNdi:{logName}] stopped");
             }
             connections = -1;
         }
@@ -263,7 +463,7 @@ namespace Rune.LowLoadNdi {
         void StartWorker() {
             workerContext = new WorkerContext { Send = sendInstance };
             var context = workerContext;
-            worker = new Thread(() => WorkerLoop(context)) { IsBackground = true, Name = "LowLoadNdi Sender" };
+            worker = new Thread(() => WorkerLoop(context)) { IsBackground = true, Name = "LowLoadNdi Sender (" + logName + ")" };
             worker.Start();
         }
 
@@ -274,7 +474,7 @@ namespace Rune.LowLoadNdi {
             wake.Set();
             var stopped = worker.Join(2000);
             if (!stopped) {
-                Debug.LogWarning("[LowLoadNdi] sender thread did not stop in time; leaving its buffers and NDI sender alive");
+                Debug.LogWarning($"[LowLoadNdi:{logName}] sender thread did not stop in time; leaving its buffers and NDI sender alive");
                 lastError = "送信スレッドが止まらなかったので、バッファと NDI の送信を解放せずに残しました（Warudo を再起動すると片付きます）";
             }
             worker = null;
@@ -283,7 +483,7 @@ namespace Rune.LowLoadNdi {
             return stopped;
         }
 
-        // ───────── バッファ ─────────
+        // ───── バッファ ─────
 
         // 作り直せたら true。送信スレッドが止まらなかったときは、送信ごと止めて false
         bool RebuildBuffers(int w, int h) {
@@ -301,7 +501,7 @@ namespace Rune.LowLoadNdi {
             height = h;
             stagingIsBgra = SystemInfo.IsFormatSupported(GraphicsFormat.B8G8R8A8_SRGB, FormatUsage.Render);
             staging = new RenderTexture(w, h, 0, stagingIsBgra ? GraphicsFormat.B8G8R8A8_SRGB : GraphicsFormat.R8G8B8A8_SRGB) {
-                name = "LowLoadNdi Staging",
+                name = "LowLoadNdi Staging (" + logName + ")",
                 hideFlags = HideFlags.HideAndDontSave
             };
             staging.Create();
@@ -316,7 +516,7 @@ namespace Rune.LowLoadNdi {
             }
 
             StartWorker();
-            Debug.Log($"[LowLoadNdi] buffers {w}x{h} ({(stagingIsBgra ? "BGRA" : "RGBA→BGRA")})");
+            Debug.Log($"[LowLoadNdi:{logName}] buffers {w}x{h} ({(stagingIsBgra ? "BGRA" : "RGBA→BGRA")})");
             return true;
         }
 
@@ -339,6 +539,12 @@ namespace Rune.LowLoadNdi {
             width = height = 0;
         }
 
+        bool HasFreeSlot() {
+            if (slots == null) return true;   // まだ作っていない（最初の Send で作る）
+            foreach (var s in slots) if (Volatile.Read(ref s.State) == 0) return true;
+            return false;
+        }
+
         Slot TakeFreeSlot() {
             foreach (var s in slots) {
                 if (Interlocked.CompareExchange(ref s.State, 1, 0) == 0) return s;
@@ -346,29 +552,39 @@ namespace Rune.LowLoadNdi {
             return null;
         }
 
-        // ───────── 描画ループ側 ─────────
+        // ───── 描画ループ側 ─────
 
-        void Tick() {
-            var source = CopyOutputToTexture.OutputTexture;
-            if (source == null) return;
-            if (source.width != width || source.height != height || staging == null) {
-                if (!RebuildBuffers(source.width, source.height)) return;
-            }
+        // このフレームで送るなら true。フレームの終わりに毎フレーム呼ぶ（呼ぶたびに描画 1 フレームの時間を測る）。
+        // true のときは、続けて Send を呼ぶ
+        public bool IsSendFrame() {
+            var dt = (double)Time.unscaledDeltaTime;
+            averageFrameTime = averageFrameTime <= 0.0 ? dt : averageFrameTime + (dt - averageFrameTime) * 0.1;
 
             // 送信の時刻に半フレーム分の余裕を持たせる。ちょうどの時刻より少し早く来たフレームも送るので、
             // Warudo の fps を送信 fps と同じくらいに固定していても、フレームの揺れで 1 枚飛ばすことがない
             var now = Time.realtimeSinceStartupAsDouble;
-            var interval = SendRate.Interval();
+            var interval = rate.Interval();
             var tolerance = Math.Min(averageFrameTime, interval) * 0.5;
-            if (now < nextSendTime - tolerance) return;
+            if (now < nextSendTime - tolerance) return false;
             nextSendTime += interval;
             // 1 回分以上遅れていたら（Warudo の fps が送信 fps より低い、引っかかったなど）、追いつこうとせずに数え直す
             if (nextSendTime < now - interval) nextSendTime = now + interval;
 
-            if (PauseWithoutReceivers && connections == 0) return;
+            if (PauseWithoutReceivers && connections == 0) return false;
+            if (!HasFreeSlot()) {   // 送信が追いついていない
+                droppedCount++;
+                return false;
+            }
+            return true;
+        }
 
+        public void Send(Texture source) {
+            if (!running || source == null) return;
+            if (source.width != width || source.height != height || staging == null) {
+                if (!RebuildBuffers(source.width, source.height)) return;
+            }
             var slot = TakeFreeSlot();
-            if (slot == null) {   // 送信が追いついていない
+            if (slot == null) {
                 droppedCount++;
                 return;
             }
@@ -391,15 +607,15 @@ namespace Rune.LowLoadNdi {
                 Volatile.Write(ref slot.State, 0);
                 return;
             }
-            mainWatch.Restart();
+            callbackWatch.Restart();
             Volatile.Write(ref slot.State, 2);
             queue.Enqueue(slot);
             wake.Set();
-            mainWatch.Stop();
-            mainTicks += mainWatch.ElapsedTicks;
+            callbackWatch.Stop();
+            callbackTicks += callbackWatch.ElapsedTicks;
         }
 
-        // ───────── 送信スレッド ─────────
+        // ───── 送信スレッド ─────
 
         void WorkerLoop(WorkerContext context) {
             var send = context.Send;
@@ -442,36 +658,27 @@ namespace Rune.LowLoadNdi {
             }
         }
 
-        // ───────── 状態表示 ─────────
+        // ───── 状態表示 ─────
 
-        void UpdateStatus(float elapsed) {
+        // 1 秒ごとに呼ぶ。実際の送信 fps などを sb に書く
+        public void AppendStatus(StringBuilder sb, float elapsed) {
             var sent = Volatile.Read(ref sentCount);
             var fps = elapsed > 0f ? (sent - lastSentCount) / elapsed : 0f;
             lastSentCount = sent;
-            var mainUs = mainFrames > 0 ? mainTicks * 1e6 / Stopwatch.Frequency / mainFrames : 0.0;
-            mainTicks = 0;
-            mainFrames = 0;
 
-            var sb = new StringBuilder();
             if (!running) {
                 sb.Append(lastError != null ? "**エラー**：" + lastError : "停止中");
-            } else {
-                var receivers = connections;
-                var waiting = PauseWithoutReceivers && receivers == 0;
-                sb.Append(waiting ? "受信者を待っています（読み戻しは止めています）" : "送信中");
-                sb.Append($"\n\n- 実際の送信fps：{fps:0.00}");
-                sb.Append($"\n- 解像度：{(width > 0 ? $"{width}×{height}" : "—")}（{(Alpha ? "BGRA" : "BGRX")}）");
-                // NDI が返すのは受信アプリの数ではなく接続の数（Studio Monitor 1 つで 2 になる）
-                sb.Append($"\n- NDI の接続数：{(receivers < 0 ? "—" : receivers.ToString())}");
-                sb.Append($"\n- 送信が追いつかず飛ばした回数：{droppedCount}");
-                sb.Append($"\n- メインスレッドで使った時間：{mainUs:0.0} µs／フレーム");
-                if (lastError != null) sb.Append($"\n\n**エラー**：{lastError}");
+                return;
             }
-            var core = Context.PluginManager.GetPlugin<CorePlugin>();
-            if (core != null && core.NdiOutput) sb.Append("\n\n**注意**：内蔵の「NDI出力」がオンです。負荷を比べるときは「いいえ」にしてください。");
-
-            var text = sb.ToString();
-            if (text != Status) SetDataInput(nameof(Status), text, true);
+            var receivers = connections;
+            var waiting = PauseWithoutReceivers && receivers == 0;
+            sb.Append(waiting ? "受信者を待っています（読み戻しは止めています）" : "送信中");
+            sb.Append($"\n\n- 実際の送信fps：{fps:0.00}");
+            sb.Append($"\n- 解像度：{(width > 0 ? $"{width}×{height}" : "—")}（{(alphaFlag ? "BGRA" : "BGRX")}）");
+            // NDI が返すのは受信アプリの数ではなく接続の数（Studio Monitor 1 つで 2 になる）
+            sb.Append($"\n- NDI の接続数：{(receivers < 0 ? "—" : receivers.ToString())}");
+            sb.Append($"\n- 送信が追いつかず飛ばした回数：{droppedCount}");
+            if (lastError != null) sb.Append($"\n\n**エラー**：{lastError}");
         }
     }
 
