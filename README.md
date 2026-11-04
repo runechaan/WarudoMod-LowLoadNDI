@@ -43,7 +43,7 @@ Do not install both at once; they share the same plugin ID.
 
 - 有効 / Enabled
 - NDI名 / NDI name（既定 `Warudo LowLoad`）
-- 送信fps / Send fps（既定 59.94）
+- 送信fps / Send fps：60・59.94・50・30・29.97・25・24・23.976・15・10 から選ぶ（既定 59.94）。モニター用なら 30 などに下げると、さらに軽くなる / Pick from common video rates; lower it (e.g. 30) for monitoring feeds to save more
 - アルファ / Alpha
 - 状態表示 / Status（送信の回数など）
 

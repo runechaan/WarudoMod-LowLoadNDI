@@ -32,7 +32,7 @@ namespace Rune.LowLoadNdi {
         Id = "runechaan.lowloadndi",
         Name = "Low-Load NDI Output",
         Description = "Sends the main output over NDI at its own frame rate without stalling the render loop.",
-        Version = "0.3.0",
+        Version = "0.4.0",
         Author = "RUNE.",
         AssetTypes = new System.Type[] { },
         NodeTypes = new System.Type[] { })]
@@ -52,9 +52,8 @@ namespace Rune.LowLoadNdi {
 
         [DataInput]
         [Label("送信fps")]
-        [Description("NDI へ送る回数（毎秒）。Warudo の描画 fps とは別に決める。")]
-        [FloatSlider(1f, 120f, 0.01f)]
-        public float SendFps = 59.94f;
+        [Description("NDI へ送る回数（毎秒）。Warudo の描画 fps とは別に決める。モニター用なら 30 などに下げると、さらに軽くなる。")]
+        public NdiFrameRate SendRate = NdiFrameRate.Fps59_94;   // v0.3.0 までの float の SendFps とは別の名前にして、古い値は読まない
 
         [DataInput]
         [Label("アルファ")]
@@ -189,7 +188,7 @@ namespace Rune.LowLoadNdi {
 
             var now = Time.realtimeSinceStartupAsDouble;
             if (now < nextSendTime) return;
-            var interval = 1.0 / Mathf.Clamp(SendFps, 1f, 240f);
+            var interval = SendRate.Interval();
             nextSendTime += interval;
             if (nextSendTime < now) nextSendTime = now + interval;   // 大きく遅れたら、追いつこうとせずに数え直す
 
@@ -224,6 +223,46 @@ namespace Rune.LowLoadNdi {
 
             var text = sb.ToString();
             if (text != Status) SetDataInput(nameof(Status), text, true);
+        }
+    }
+
+    // ───────── 送信 fps の選択肢 ─────────
+
+    // 映像でよく使う fps だけを選べるようにする（下限は 10）。
+    // ドロップダウンにするため、入れ子でなくトップレベルの enum にする（入れ子の enum は Warudo で表示できない）
+    public enum NdiFrameRate {
+        [Label("60")] Fps60,
+        [Label("59.94")] Fps59_94,
+        [Label("50")] Fps50,
+        [Label("30")] Fps30,
+        [Label("29.97")] Fps29_97,
+        [Label("25")] Fps25,
+        [Label("24")] Fps24,
+        [Label("23.976")] Fps23_976,
+        [Label("15")] Fps15,
+        [Label("10")] Fps10,
+    }
+
+    public static class NdiFrameRateExtensions {
+        // NDI に渡す分数（59.94 などは NTSC の 1001 分母）
+        public static void Fraction(this NdiFrameRate rate, out int numerator, out int denominator) {
+            switch (rate) {
+                case NdiFrameRate.Fps60: numerator = 60; denominator = 1; break;
+                case NdiFrameRate.Fps50: numerator = 50; denominator = 1; break;
+                case NdiFrameRate.Fps30: numerator = 30; denominator = 1; break;
+                case NdiFrameRate.Fps29_97: numerator = 30000; denominator = 1001; break;
+                case NdiFrameRate.Fps25: numerator = 25; denominator = 1; break;
+                case NdiFrameRate.Fps24: numerator = 24; denominator = 1; break;
+                case NdiFrameRate.Fps23_976: numerator = 24000; denominator = 1001; break;
+                case NdiFrameRate.Fps15: numerator = 15; denominator = 1; break;
+                case NdiFrameRate.Fps10: numerator = 10; denominator = 1; break;
+                default: numerator = 60000; denominator = 1001; break;   // 59.94
+            }
+        }
+
+        public static double Interval(this NdiFrameRate rate) {
+            rate.Fraction(out var n, out var d);
+            return (double)d / n;
         }
     }
 }
