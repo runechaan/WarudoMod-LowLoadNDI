@@ -110,8 +110,8 @@ The video-camera icon in the toolbar opens this settings page.
 - 受信者がいないときは止める / Pause without receivers（受信者が 0 のあいだは描画もしない）
 - 状態表示 / Status（Warudo が描画しているか、自分で描画させた回数など）
 
-自分で描画させるのは Built-in RP のときだけです（URP では、メインカメラのときだけ映像が更新されます）。
-Rendering on demand works in the Built-in render pipeline only.
+メインカメラ以外のカメラは、送るフレームだけカメラを有効にして、Warudo のふつうの描画で描かせます。そのためポストプロセスもふつうにかかります。モーションブラーは「前に送ったときからの動き」でブレるので、送信 fps が低いほどブレが長くなります（本物のカメラで fps を下げたときと同じ）。Built-in RP で確認済み、URP は未確認です。
+A non-main camera is enabled only on send frames and rendered through Warudo's normal pipeline, so post-processing works as usual. Motion blur covers the motion since the previous send, so it gets longer at lower send rates, like a real camera. Tested in the Built-in render pipeline; URP is untested.
 
 使うときは、Warudo の設定の内蔵「NDI出力」と、カメラの内蔵「NDI出力」を「いいえ」にしてください。
 Turn off Warudo's built-in "NDI Output" setting and the cameras' own NDI outputs when you use this plugin.
