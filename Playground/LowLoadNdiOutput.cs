@@ -59,7 +59,7 @@ namespace Rune.LowLoadNdi {
         Id = "runechaan.lowloadndi",
         Name = "Low-Load NDI Output",
         Description = "Sends the main output over NDI at its own frame rate without stalling the render loop.",
-        Version = "0.3.0",
+        Version = "0.3.1",
         Author = "RUNE.",
         AssetTypes = new Type[] { },
         NodeTypes = new Type[] { })]
@@ -221,9 +221,11 @@ namespace Rune.LowLoadNdi {
         readonly NdiPipeline pipeline = new NdiPipeline("camera");
         readonly Stopwatch mainWatch = new Stopwatch();
         long mainTicks;
-        long renderTicks;           // そのうち、カメラを自分で描画させた時間
         int mainFrames;
-        int selfRenderCount;        // この 1 秒に自分で描画させた回数
+        int selfRenderCount;        // この 1 秒に描画させた回数
+        bool warudoRenders;         // 直近のフレームで、Warudo 自身がこのカメラを描画する予定だったか（状態表示用）
+        bool sendThisFrame;         // OnPostLateUpdate で、このフレームを送ると決めた
+        Camera forcedCamera;        // このフレームだけ有効にしたカメラ。フレームの終わりに元に戻す
         float statusTimer;
 
         protected override void OnCreate() {
@@ -263,31 +265,16 @@ namespace Rune.LowLoadNdi {
             Apply();
         }
 
-        public override void OnEndOfFrame() {
-            base.OnEndOfFrame();
-            if (!pipeline.Running) return;
-            var camera = SourceCamera != null ? SourceCamera.Camera : null;
-            if (camera == null || camera.targetTexture == null) return;
-
-            mainWatch.Restart();
-            if (pipeline.IsSendFrame()) {
-                // Warudo が描画していないカメラ（CameraAsset.ShouldRender が false）は、送るフレームだけ自分で描画させる。
-                // フレームの終わりの時点で enabled なら、このフレームはもう描画されている
-                if (!camera.enabled && GraphicsSettings.currentRenderPipeline == null) {
-                    var renderStart = mainWatch.ElapsedTicks;
-                    camera.Render();
-                    renderTicks += mainWatch.ElapsedTicks - renderStart;
-                    selfRenderCount++;
-                }
-                pipeline.Send(camera.targetTexture);
-            }
-            mainWatch.Stop();
-            mainTicks += mainWatch.ElapsedTicks;
-        }
-
+        // 描画の前：このフレームを送るか決め、Warudo が描画しないカメラなら、このフレームだけ有効にして描画させる
         public override void OnPostLateUpdate() {
             base.OnPostLateUpdate();
             mainFrames++;
+            if (pipeline.Running) {
+                mainWatch.Restart();
+                PrepareSend();
+                mainWatch.Stop();
+                mainTicks += mainWatch.ElapsedTicks;
+            }
             statusTimer += Time.unscaledDeltaTime;
             if (statusTimer >= 1f) {
                 UpdateStatus(statusTimer);
@@ -295,13 +282,46 @@ namespace Rune.LowLoadNdi {
             }
         }
 
+        void PrepareSend() {
+            sendThisFrame = false;
+            var camera = SourceCamera != null ? SourceCamera.Camera : null;
+            if (camera == null || camera.targetTexture == null) return;
+
+            // Warudo は Update で、描画するカメラだけを enabled にする（CameraAsset.ShouldRender）。ここはその後なので、今の値がこのフレームの予定
+            warudoRenders = camera.enabled;
+            if (!pipeline.IsSendFrame()) return;
+            sendThisFrame = true;
+            if (!camera.enabled) {
+                // ふつうの描画の流れで描画させる。前は送るフレームの終わりに Camera.Render() を呼んでいたが、
+                // それだとカメラの「前回の向き」が更新されないらしく、モーションブラーが画面全体に大きくかかった
+                camera.enabled = true;
+                forcedCamera = camera;
+                selfRenderCount++;
+            }
+        }
+
+        // 描画が終わったあと：送ると決めたフレームなら取り込み、有効にしたカメラを元に戻す
+        public override void OnEndOfFrame() {
+            base.OnEndOfFrame();
+            mainWatch.Restart();
+            if (sendThisFrame && pipeline.Running) {
+                var camera = SourceCamera != null ? SourceCamera.Camera : null;
+                if (camera != null && camera.targetTexture != null) pipeline.Send(camera.targetTexture);
+            }
+            sendThisFrame = false;
+            if (forcedCamera != null) {
+                forcedCamera.enabled = false;   // 次の Update で Warudo がまた決め直すが、それまでのあいだも元の状態にしておく
+                forcedCamera = null;
+            }
+            mainWatch.Stop();
+            mainTicks += mainWatch.ElapsedTicks;
+        }
+
         void UpdateStatus(float elapsed) {
             var perFrame = mainFrames > 0 ? 1e6 / Stopwatch.Frequency / mainFrames : 0.0;
             var mainUs = (mainTicks + pipeline.TakeCallbackTicks()) * perFrame;
-            var renderUs = renderTicks * perFrame;
             var renders = elapsed > 0f ? selfRenderCount / elapsed : 0f;
             mainTicks = 0;
-            renderTicks = 0;
             mainFrames = 0;
             selfRenderCount = 0;
 
@@ -311,15 +331,12 @@ namespace Rune.LowLoadNdi {
             } else {
                 pipeline.AppendStatus(sb, elapsed);
                 if (pipeline.Running) {
-                    var camera = SourceCamera.Camera;
-                    if (camera != null && camera.enabled) {
+                    if (warudoRenders) {
                         sb.Append("\n- 描画：Warudo が毎フレーム描画しています（メインカメラ、または内蔵の出力がオン）");
-                    } else if (GraphicsSettings.currentRenderPipeline != null) {
-                        sb.Append("\n- 描画：**URP では自分で描画させられません**。メインカメラのときだけ映像が更新されます");
                     } else {
                         sb.Append($"\n- 描画：送るフレームだけ描画させています（{renders:0.00} 回／秒）");
                     }
-                    sb.Append($"\n- メインスレッドで使った時間：{mainUs:0.0} µs／フレーム（うちカメラの描画 {renderUs:0.0} µs）");
+                    sb.Append($"\n- メインスレッドで使った時間：{mainUs:0.0} µs／フレーム（カメラの描画そのものは含まない）");
                 }
                 if (SourceCamera.NdiOutput) sb.Append("\n\n**注意**：このカメラの内蔵「NDI出力」がオンです。そのカメラが毎フレーム描画・読み戻しされるので、「いいえ」にしてください。");
             }
@@ -554,8 +571,8 @@ namespace Rune.LowLoadNdi {
 
         // ───── 描画ループ側 ─────
 
-        // このフレームで送るなら true。フレームの終わりに毎フレーム呼ぶ（呼ぶたびに描画 1 フレームの時間を測る）。
-        // true のときは、続けて Send を呼ぶ
+        // このフレームで送るなら true。毎フレーム 1 回呼ぶ（呼ぶたびに描画 1 フレームの時間を測る）。
+        // true のときは、そのフレームの終わりに Send を呼ぶ
         public bool IsSendFrame() {
             var dt = (double)Time.unscaledDeltaTime;
             averageFrameTime = averageFrameTime <= 0.0 ? dt : averageFrameTime + (dt - averageFrameTime) * 0.1;
