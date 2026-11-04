@@ -22,6 +22,36 @@ This plugin reads back asynchronously, and only as often as the NDI send rate.
 - **LED walls and stage screens**: send at whatever the equipment expects (24, 25, 30 fps …). 59.94, 29.97 and 23.976 use the NTSC 1001 denominator, so receivers show the right rate.
 - **Per-camera outputs**: the built-in per-camera NDI output renders and reads back that camera every frame. The camera output asset renders a non-main camera **only on send frames**, so sending at 30 fps costs 30 renders a second. The more sub-cameras you send, the bigger the difference.
 
+## 内蔵 NDI との比較 / Comparison with the built-in NDI output
+
+内蔵の動きは、Warudo Pro 0.15.1 のコード（`CorePlugin.UpdateNdiOutput`、`CameraAsset.UpdateNdiOutputs`、`CameraAsset.ShouldRender`）と、同梱の KlakNDI（`NdiSender`）で確認した内容です。
+
+| | 内蔵「NDI出力」 | このプラグイン（Playground 版） | このプラグイン（MOD 版） |
+|---|---|---|---|
+| 送る部品 | KlakNDI の `NdiSender`（Texture モード） | NDI SDK を直接呼ぶ | KlakNDI の `NdiSender` を借りる |
+| 読み戻す回数 | **描画したフレームすべて** | 送信 fps の回数だけ | 送信 fps の回数だけ |
+| 送信 fps | 選べない（描画 fps のまま） | 60〜10 の 10 種類から選ぶ | 60〜10 の 10 種類から選ぶ |
+| 受信側の fps 表記 | 常に 59.94p（KlakNDI がフレームレートを書かない） | 選んだ fps | 常に 59.94p |
+| 取り込むタイミング | フレームの終わり | フレームの終わり（内蔵と同じフレーム） | フレームの終わり（内蔵と同じフレーム） |
+| YUV への変換 | GPU（UYVA） | NDI が CPU で行う（BGRA／BGRX で渡す） | GPU（UYVY／UYVA） |
+| アルファ | 常にあり | 選べる | 選べる |
+| 送信の待ち | 前の送信が終わるまで、メインスレッドで待つ | 別スレッドで送るので、描画ループは待たない | メインスレッドで待つ（送信 fps の回数だけ） |
+| 受信者がいないとき | 送り続ける | 読み戻しも止める（設定で切り替え） | 送り続ける |
+| NDI 名 | `Warudo` 固定 | 設定で決める | 設定で決める |
+| カメラごとの出力 | カメラの「NDI出力」。そのカメラが毎フレーム描画・読み戻しされる | アセット「Low-Load NDI カメラ出力」。メインカメラ以外は送信フレームだけ描画 | なし |
+| ツールバーのアイコン | なし | あり | あり |
+
+- **負荷**：fps 制限なしのとき、内蔵は CPU Busy が約 1.1ms 増えた（1.66ms）。このプラグインはほぼ増えない（MOD 版で 0.56ms、内蔵 NDI オフは 0.52ms）。下の「計測」を参照。
+- **fps を 60 に固定して、60fps で送るだけなら**：内蔵も読み戻しは毎秒 60 回なので、差は小さい。差が出るのは、送信 fps を下げたとき、カメラ出力を使うとき、fps を制限していないとき。
+- **遅延**：どれも同じフレームの映像を取り込み、GPU からの読み戻しの仕組みも同じ。Playground 版は YUV への変換を CPU で行うぶん、数ミリ秒遅くなる可能性がある（未計測）。送信 fps を下げると、次に送るまでのあいだ受信側の映像は前のフレームのままになる。
+
+The built-in behaviour above was confirmed in Warudo Pro 0.15.1's code and its bundled KlakNDI.
+
+- **Built-in**: KlakNDI `NdiSender` in Texture mode. Converts to UYVA on the GPU and reads back **every rendered frame**, waits on the main thread for the previous send, always sends alpha, always named `Warudo`, and receivers always see 59.94p because no frame rate is written. A camera's own NDI output forces that camera to render every frame.
+- **This plugin, Playground**: reads back only at the chosen send rate (10 choices from 60 to 10), sends on a worker thread, writes the real frame rate, lets you choose alpha, stops reading back when nobody is connected, and its camera asset renders a non-main camera only on send frames. NDI does the YUV conversion on the CPU, which may add a few ms of latency (not measured).
+- **This plugin, MOD**: drives KlakNDI only on send frames (GPU YUV conversion). Main output only, and receivers see 59.94p.
+- All of them capture the same end-of-frame image. With Warudo capped at 60 fps and sending 60 fps, the difference from the built-in output is small; it shows when you lower the send rate, use camera outputs, or run uncapped.
+
 ## ~~正直なところ / To be honest~~
 
 ~~**Warudo の fps を 60 などに固定して使っているなら、内蔵の「NDI出力」との差はほぼありません。**
