@@ -7,8 +7,8 @@
 // NDI への送信は別スレッドで行うので、描画ループを待たせない。
 //
 // 流れ：
-//   描画ループ（OnPostLateUpdate）
-//     送信の時刻になったら CopyOutputToTexture.OutputTexture（内蔵 NDI と同じ映像）を
+//   描画ループ（OnEndOfFrame。描画が終わったあとなので、そのフレームの映像を取れる）
+//     送信の時刻（半フレーム分の余裕つき）になったら CopyOutputToTexture.OutputTexture（内蔵 NDI と同じ映像）を
 //     上下反転して BGRA の作業用テクスチャへ Blit し、自分のバッファ（NativeArray）へ直接
 //     読み戻すよう AsyncGPUReadback.RequestIntoNativeArray で依頼する（待たない）
 //   読み戻しの完了（メインスレッドのコールバック）
@@ -50,7 +50,7 @@ namespace Rune.LowLoadNdi {
         Id = "runechaan.lowloadndi",
         Name = "Low-Load NDI Output",
         Description = "Sends the main output over NDI at its own frame rate without stalling the render loop.",
-        Version = "0.2.1",
+        Version = "0.2.2",
         Author = "RUNE.",
         AssetTypes = new Type[] { },
         NodeTypes = new Type[] { })]
@@ -105,10 +105,16 @@ namespace Rune.LowLoadNdi {
             public int State;       // 0 = 空き、1 = 読み戻し中、2 = 送信待ち・送信中
         }
 
+        // 送信スレッドごとの止め札。止まらなかったスレッドを置き去りにしても、次のスレッドの札とは混ざらない
+        sealed class WorkerContext {
+            public IntPtr Send;
+            public volatile bool Stop;
+        }
+
         bool running;
         IntPtr sendInstance = IntPtr.Zero;
         Thread worker;
-        volatile bool stopWorker;
+        WorkerContext workerContext;
         readonly AutoResetEvent wake = new AutoResetEvent(false);
         readonly ConcurrentQueue<Slot> queue = new ConcurrentQueue<Slot>();
 
@@ -119,6 +125,7 @@ namespace Rune.LowLoadNdi {
         int generation;             // 作り直したら増やす。古い読み戻しの完了を捨てるため
 
         double nextSendTime;
+        double averageFrameTime;    // 描画 1 フレームの時間（ならした値）。送信の時刻の判定の余裕に使う
 
         // 送信スレッドが読む値（メインスレッドが書く）
         volatile bool alphaFlag;
@@ -159,15 +166,23 @@ namespace Rune.LowLoadNdi {
             base.OnDestroy();
         }
 
-        public override void OnPostLateUpdate() {
-            base.OnPostLateUpdate();
+        // 描画が終わったあと（フレームの終わり）に取り込む。描画の前に取り込むと、ひとつ前のフレームの映像になり 1 フレーム遅れる
+        public override void OnEndOfFrame() {
+            base.OnEndOfFrame();
             if (running) {
                 mainWatch.Restart();
                 Tick();
                 mainWatch.Stop();
                 mainTicks += mainWatch.ElapsedTicks;
             }
+        }
+
+        public override void OnPostLateUpdate() {
+            base.OnPostLateUpdate();
             mainFrames++;
+
+            var dt = (double)Time.unscaledDeltaTime;
+            averageFrameTime = averageFrameTime <= 0.0 ? dt : averageFrameTime + (dt - averageFrameTime) * 0.1;
 
             statusTimer += Time.unscaledDeltaTime;
             if (statusTimer >= 1f) {
@@ -231,11 +246,14 @@ namespace Rune.LowLoadNdi {
 
         void StopOutput() {
             running = false;
-            StopWorker();
-            ReleaseBuffers();
+            var stopped = StopWorker();
+            ReleaseBuffers(stopped);
             if (sendInstance != IntPtr.Zero) {
-                try { Ndi.NDIlib_send_destroy(sendInstance); }
-                catch (Exception e) { Debug.LogError("[LowLoadNdi] " + e); }
+                // 送信スレッドが NDI の中で止まったままなら、送信を壊すと落ちるので残す（Warudo を終了すれば片付く）
+                if (stopped) {
+                    try { Ndi.NDIlib_send_destroy(sendInstance); }
+                    catch (Exception e) { Debug.LogError("[LowLoadNdi] " + e); }
+                }
                 sendInstance = IntPtr.Zero;
                 Debug.Log("[LowLoadNdi] stopped");
             }
@@ -243,26 +261,41 @@ namespace Rune.LowLoadNdi {
         }
 
         void StartWorker() {
-            stopWorker = false;
-            worker = new Thread(WorkerLoop) { IsBackground = true, Name = "LowLoadNdi Sender" };
+            workerContext = new WorkerContext { Send = sendInstance };
+            var context = workerContext;
+            worker = new Thread(() => WorkerLoop(context)) { IsBackground = true, Name = "LowLoadNdi Sender" };
             worker.Start();
         }
 
-        void StopWorker() {
-            if (worker == null) return;
-            stopWorker = true;
+        // 止まったら true。2 秒待っても止まらなければ、そのスレッドは置き去りにして false を返す
+        bool StopWorker() {
+            if (worker == null) return true;
+            workerContext.Stop = true;
             wake.Set();
-            if (!worker.Join(2000)) Debug.LogWarning("[LowLoadNdi] sender thread did not stop in time");
+            var stopped = worker.Join(2000);
+            if (!stopped) {
+                Debug.LogWarning("[LowLoadNdi] sender thread did not stop in time; leaving its buffers and NDI sender alive");
+                lastError = "送信スレッドが止まらなかったので、バッファと NDI の送信を解放せずに残しました（Warudo を再起動すると片付きます）";
+            }
             worker = null;
+            workerContext = null;
             while (queue.TryDequeue(out _)) { }
+            return stopped;
         }
 
         // ───────── バッファ ─────────
 
-        void RebuildBuffers(int w, int h) {
+        // 作り直せたら true。送信スレッドが止まらなかったときは、送信ごと止めて false
+        bool RebuildBuffers(int w, int h) {
             // 送信スレッドが古いバッファを使っていないことを保証してから作り直す
-            StopWorker();
-            ReleaseBuffers();
+            var stopped = StopWorker();
+            ReleaseBuffers(stopped);
+            if (!stopped) {
+                // 置き去りのスレッドが同じ NDI の送信を使っているかもしれないので、続けずに止める
+                running = false;
+                sendInstance = IntPtr.Zero;
+                return false;
+            }
 
             width = w;
             height = h;
@@ -284,14 +317,18 @@ namespace Rune.LowLoadNdi {
 
             StartWorker();
             Debug.Log($"[LowLoadNdi] buffers {w}x{h} ({(stagingIsBgra ? "BGRA" : "RGBA→BGRA")})");
+            return true;
         }
 
-        void ReleaseBuffers() {
+        // workerStopped が false（送信スレッドがまだバッファを読んでいるかもしれない）なら、バッファは解放せずに手放す
+        void ReleaseBuffers(bool workerStopped) {
             generation++;   // 読み戻し中のものは、完了しても捨てる
             if (slots != null) {
                 // GPU がまだ書き込んでいるバッファを解放しないよう、読み戻しを全部終わらせる（停止と解像度変更のときだけ）
                 AsyncGPUReadback.WaitAllRequests();
-                foreach (var s in slots) if (s.Buffer.IsCreated) s.Buffer.Dispose();
+                if (workerStopped) {
+                    foreach (var s in slots) if (s.Buffer.IsCreated) s.Buffer.Dispose();
+                }
                 slots = null;
             }
             if (staging != null) {
@@ -315,14 +352,18 @@ namespace Rune.LowLoadNdi {
             var source = CopyOutputToTexture.OutputTexture;
             if (source == null) return;
             if (source.width != width || source.height != height || staging == null) {
-                RebuildBuffers(source.width, source.height);
+                if (!RebuildBuffers(source.width, source.height)) return;
             }
 
+            // 送信の時刻に半フレーム分の余裕を持たせる。ちょうどの時刻より少し早く来たフレームも送るので、
+            // Warudo の fps を送信 fps と同じくらいに固定していても、フレームの揺れで 1 枚飛ばすことがない
             var now = Time.realtimeSinceStartupAsDouble;
-            if (now < nextSendTime) return;
             var interval = SendRate.Interval();
+            var tolerance = Math.Min(averageFrameTime, interval) * 0.5;
+            if (now < nextSendTime - tolerance) return;
             nextSendTime += interval;
-            if (nextSendTime < now) nextSendTime = now + interval;   // 大きく遅れたら、追いつこうとせずに数え直す
+            // 1 回分以上遅れていたら（Warudo の fps が送信 fps より低い、引っかかったなど）、追いつこうとせずに数え直す
+            if (nextSendTime < now - interval) nextSendTime = now + interval;
 
             if (PauseWithoutReceivers && connections == 0) return;
 
@@ -360,13 +401,13 @@ namespace Rune.LowLoadNdi {
 
         // ───────── 送信スレッド ─────────
 
-        void WorkerLoop() {
-            var send = sendInstance;
+        void WorkerLoop(WorkerContext context) {
+            var send = context.Send;
             var pollWatch = Stopwatch.StartNew();
             var pollFirst = true;
-            while (!stopWorker) {
+            while (!context.Stop) {
                 wake.WaitOne(250);
-                if (stopWorker) break;
+                if (context.Stop) break;
 
                 if (pollFirst || pollWatch.ElapsedMilliseconds >= 500) {
                     try { connections = Ndi.NDIlib_send_get_no_connections(send, 0); }
@@ -375,7 +416,7 @@ namespace Rune.LowLoadNdi {
                     pollFirst = false;
                 }
 
-                while (!stopWorker && queue.TryDequeue(out var slot)) {
+                while (!context.Stop && queue.TryDequeue(out var slot)) {
                     var frame = new Ndi.VideoFrame {
                         Width = slot.Width,
                         Height = slot.Height,

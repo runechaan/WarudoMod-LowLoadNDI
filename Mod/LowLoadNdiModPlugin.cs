@@ -32,7 +32,7 @@ namespace Rune.LowLoadNdi {
         Id = "runechaan.lowloadndi",
         Name = "Low-Load NDI Output",
         Description = "Sends the main output over NDI at its own frame rate without stalling the render loop.",
-        Version = "0.4.0",
+        Version = "0.4.1",
         Author = "RUNE.",
         AssetTypes = new System.Type[] { },
         NodeTypes = new System.Type[] { })]
@@ -80,6 +80,7 @@ namespace Rune.LowLoadNdi {
         Texture nullTexture;    // 破棄済み。NdiSender の sourceTexture != null を false にするために渡す
         bool armed;             // このフレームで sourceTexture を入れた
         double nextSendTime;
+        double averageFrameTime;    // 描画 1 フレームの時間（ならした値）。送信の時刻の判定の余裕に使う
         string lastError;
 
         float statusTimer;
@@ -111,6 +112,8 @@ namespace Rune.LowLoadNdi {
 
         public override void OnPostLateUpdate() {
             base.OnPostLateUpdate();
+            var dt = (double)Time.unscaledDeltaTime;
+            averageFrameTime = averageFrameTime <= 0.0 ? dt : averageFrameTime + (dt - averageFrameTime) * 0.1;
             if (running) {
                 mainWatch.Restart();
                 Tick();
@@ -186,11 +189,15 @@ namespace Rune.LowLoadNdi {
                 armed = false;
             }
 
+            // 送信の時刻に半フレーム分の余裕を持たせる。ちょうどの時刻より少し早く来たフレームも送るので、
+            // Warudo の fps を送信 fps と同じくらいに固定していても、フレームの揺れで 1 枚飛ばすことがない
             var now = Time.realtimeSinceStartupAsDouble;
-            if (now < nextSendTime) return;
             var interval = SendRate.Interval();
+            var tolerance = System.Math.Min(averageFrameTime, interval) * 0.5;
+            if (now < nextSendTime - tolerance) return;
             nextSendTime += interval;
-            if (nextSendTime < now) nextSendTime = now + interval;   // 大きく遅れたら、追いつこうとせずに数え直す
+            // 1 回分以上遅れていたら（Warudo の fps が送信 fps より低い、引っかかったなど）、追いつこうとせずに数え直す
+            if (nextSendTime < now - interval) nextSendTime = now + interval;
 
             var source = CopyOutputToTexture.OutputTexture;
             if (source == null) return;
