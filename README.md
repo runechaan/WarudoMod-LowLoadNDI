@@ -1,30 +1,60 @@
 # Low-Load NDI Output for Warudo
 
 Warudo の映像を、描画ループを待たせずに NDI で送るプラグインです。メイン出力と、カメラごとの出力に使えます。
-内蔵の「NDI出力」は毎フレーム GPU からの読み戻しを行うため、fps を制限せずに動かしていると、オンにしたとき Warudo の fps が大きく下がります（空のシーンで約 1200 → 570fps）。
-このプラグインは、送信 fps のタイミングでだけ非同期に読み戻すので、有効にしても fps はほとんど下がりません。
 
 Sends Warudo's video over NDI without stalling the render loop, for the main output and for individual cameras.
-The built-in NDI output reads back from the GPU every frame, which roughly halves Warudo's frame rate when the frame rate is uncapped.
-This plugin reads back asynchronously, and only as often as the NDI send rate.
 
-## 便利なところ / Where it helps
+## Warudo の内蔵 NDI 出力の問題点 / Problems with Warudo's built-in NDI output
 
-**送信 fps を、Warudo の描画 fps とは別に決められます。** 内蔵の NDI は、描画したフレームをすべて送ります。
+Warudo Pro 0.15.1 のコード（`CorePlugin.UpdateNdiOutput`、`CameraAsset.UpdateNdiOutputs`、`CameraAsset.ShouldRender`）と、同梱の KlakNDI（`NdiSender`）で確認した内容です。
+
+1. **描画したフレームをすべて読み戻して送る**：GPU で YUV に変換し、読み戻して NDI に渡す処理を、描画のたびに行います。送る回数を間引く処理はありません。fps を制限せずに動かしていると、オンにしただけで空のシーンでも fps が約半分になります（約 1200 → 570fps、CPU Busy 0.52 → 1.66ms）。
+2. **前の送信が終わるまで、メインスレッドで待つ**：NDI への送信は非同期ですが、次のフレームを渡すときに前の送信の終わりを待ちます。この待ちが描画ループの中で起きます。
+3. **送信 fps を選べない**：Warudo の描画 fps のまま送ります。モニター用に 30fps だけ送る、といった使い分けができません。
+4. **受信側の fps 表記が常に 59.94p**：送るフレームにフレームレートを書いていないので、実際に何 fps で届いていても受信側には 59.94p と表示されます。宣言された fps に合わせて出力する機材では、困ることがあります。
+5. **アルファを常に付けて送る**：透過背景を使わないときも、アルファ付き（UYVA）で変換・送信します。
+6. **NDI 名が `Warudo` で固定**：変えられません。
+7. **受信者がいなくても送り続ける**：誰も受信していなくても、毎フレームの変換と読み戻しは止まりません。
+8. **カメラごとの出力はもっと重い**：カメラアセットの「NDI出力」をオンにすると、そのカメラは**毎フレーム描画され**（メインカメラでなくても）、毎フレーム読み戻されます。オンにしたカメラの数だけ、描画と読み戻しが増えます。
+
+Warudo の fps を 60 に固定してメイン出力を 60fps で送るだけなら、1 の読み戻しも毎秒 60 回なので、負荷の差は小さくなります。それ以外の問題は、fps を固定していても残ります。
+
+Confirmed in Warudo Pro 0.15.1's code and its bundled KlakNDI (`NdiSender`).
+
+1. **Every rendered frame is read back and sent.** It converts to YUV on the GPU and reads back on every render, with no rate limiting. Uncapped, just turning it on halves the frame rate of an empty scene (about 1200 → 570 fps, CPU Busy 0.52 → 1.66 ms).
+2. **The main thread waits for the previous send** before handing over the next frame.
+3. **The send rate cannot be chosen**; it follows the render rate.
+4. **Receivers always see 59.94p**, because no frame rate is written into the frames.
+5. **Alpha is always sent** (UYVA), even when you don't need it.
+6. **The NDI name is fixed** to `Warudo`.
+7. **It keeps sending with no receivers.**
+8. **Per-camera outputs are heavier still**: a camera's own "NDI Output" makes that camera **render every frame** (even when it is not the main camera) and read back every frame.
+
+With Warudo capped at 60 fps and only the main output sent at 60 fps, problem 1 costs little, but the others remain.
+
+## このプラグインでできること / What this plugin does
+
+- **送信 fps のタイミングでだけ読み戻す**：読み戻しは非同期で、NDI への送信は別スレッドで行うので、描画ループを待たせません。有効にしても fps はほとんど下がりません（CPU Busy 0.56ms）。
+- **送信 fps を選べる**：60・59.94・50・30・29.97・25・24・23.976・15・10 から選びます。59.94・29.97・23.976 は NTSC の分数（1001 分母）で送るので、受信側の表記も正しくなります（Playground 版）。
+- **アルファ、NDI 名を選べる**。受信者がいないあいだは読み戻しも止められます（Playground 版）。
+- **カメラごとの出力**（Playground 版）：アセット「Low-Load NDI カメラ出力」を置きます。メインカメラでないカメラは**送信するフレームだけ**描画するので、30fps で送るなら描画も毎秒 30 回で済みます。
+
+- **Reads back only at the send rate**, asynchronously, and sends on a worker thread, so the render loop never waits (CPU Busy 0.56 ms with it on).
+- **Choose the send rate** from common video rates; 59.94, 29.97 and 23.976 use the 1001 denominator, so receivers show the right rate (Playground version).
+- **Choose alpha and the NDI name**, and stop reading back while nobody is connected (Playground version).
+- **Per-camera outputs** (Playground version): a non-main camera is rendered **only on send frames**.
+
+### 使いどころ / Where it helps
 
 - **モニタリング用の出力**：配信には 60fps で出しつつ、演者やスタッフが確認するためのモニターには 30fps や 15fps で送る、といった使い分けができます。送る枚数が減るぶん、NDI の圧縮（CPU）、ネットワークの帯域、受信側の負荷が減ります。
-- **LED ビジョンやステージの映像**：LED ウォールや会場モニターへ送る映像は、24・25・30fps など、つなぐ機材に合わせた fps で送れます。59.94・29.97・23.976 は NTSC の分数（1001 分母）で送るので、受信側の表記も正しくなります。
-- **カメラごとの出力**：内蔵のカメラの NDI 出力をオンにすると、そのカメラは毎フレーム描画・読み戻しされます。このプラグインのカメラ出力アセットは、メインカメラでないカメラを**送信するフレームだけ**描画するので、たとえば 30fps で送るなら描画も毎秒 30 回で済みます。サブカメラを何台も NDI で出したいときほど差が大きくなります。
+- **LED ビジョンやステージの映像**：LED ウォールや会場モニターへ送る映像は、24・25・30fps など、つなぐ機材に合わせた fps で送れます。
+- **サブカメラをいくつも NDI で出す**：内蔵のカメラ出力は台数ぶん毎フレーム描画・読み戻しが増えますが、このプラグインは送信 fps の回数だけです。台数が多いほど差が大きくなります。
 
-**You can set the NDI send rate independently of Warudo's render rate.** The built-in output sends every rendered frame.
-
-- **Monitoring feeds**: send 60 fps to the stream but 30 or 15 fps to a performer or crew monitor. Fewer frames means less NDI compression (CPU), less network bandwidth and less work on the receiver.
-- **LED walls and stage screens**: send at whatever the equipment expects (24, 25, 30 fps …). 59.94, 29.97 and 23.976 use the NTSC 1001 denominator, so receivers show the right rate.
-- **Per-camera outputs**: the built-in per-camera NDI output renders and reads back that camera every frame. The camera output asset renders a non-main camera **only on send frames**, so sending at 30 fps costs 30 renders a second. The more sub-cameras you send, the bigger the difference.
+- **Monitoring feeds**: send 60 fps to the stream but 30 or 15 fps to a performer or crew monitor, saving NDI compression (CPU), network bandwidth and receiver work.
+- **LED walls and stage screens**: send at whatever the equipment expects (24, 25, 30 fps …).
+- **Several sub-cameras over NDI**: the built-in output adds a full render and readback per camera every frame; this plugin only renders and reads back at the send rate.
 
 ## 内蔵 NDI との比較 / Comparison with the built-in NDI output
-
-内蔵の動きは、Warudo Pro 0.15.1 のコード（`CorePlugin.UpdateNdiOutput`、`CameraAsset.UpdateNdiOutputs`、`CameraAsset.ShouldRender`）と、同梱の KlakNDI（`NdiSender`）で確認した内容です。
 
 | | 内蔵「NDI出力」 | このプラグイン（Playground 版） | このプラグイン（MOD 版） |
 |---|---|---|---|
@@ -41,16 +71,18 @@ This plugin reads back asynchronously, and only as often as the NDI send rate.
 | カメラごとの出力 | カメラの「NDI出力」。そのカメラが毎フレーム描画・読み戻しされる | アセット「Low-Load NDI カメラ出力」。メインカメラ以外は送信フレームだけ描画 | なし |
 | ツールバーのアイコン | なし | あり | あり |
 
-- **負荷**：fps 制限なしのとき、内蔵は CPU Busy が約 1.1ms 増えた（1.66ms）。このプラグインはほぼ増えない（MOD 版で 0.56ms、内蔵 NDI オフは 0.52ms）。下の「計測」を参照。
-- **fps を 60 に固定して、60fps で送るだけなら**：内蔵も読み戻しは毎秒 60 回なので、差は小さい。差が出るのは、送信 fps を下げたとき、カメラ出力を使うとき、fps を制限していないとき。
 - **遅延**：どれも同じフレームの映像を取り込み、GPU からの読み戻しの仕組みも同じ。Playground 版は YUV への変換を CPU で行うぶん、数ミリ秒遅くなる可能性がある（未計測）。送信 fps を下げると、次に送るまでのあいだ受信側の映像は前のフレームのままになる。
+- **Latency**: all three capture the same end-of-frame image with the same GPU readback. The Playground version converts to YUV on the CPU, which may add a few ms (not measured).
 
-The built-in behaviour above was confirmed in Warudo Pro 0.15.1's code and its bundled KlakNDI.
+## 計測 / Measurements
 
-- **Built-in**: KlakNDI `NdiSender` in Texture mode. Converts to UYVA on the GPU and reads back **every rendered frame**, waits on the main thread for the previous send, always sends alpha, always named `Warudo`, and receivers always see 59.94p because no frame rate is written. A camera's own NDI output forces that camera to render every frame.
-- **This plugin, Playground**: reads back only at the chosen send rate (10 choices from 60 to 10), sends on a worker thread, writes the real frame rate, lets you choose alpha, stops reading back when nobody is connected, and its camera asset renders a non-main camera only on send frames. NDI does the YUV conversion on the CPU, which may add a few ms of latency (not measured).
-- **This plugin, MOD**: drives KlakNDI only on send frames (GPU YUV conversion). Main output only, and receivers see 59.94p.
-- All of them capture the same end-of-frame image. With Warudo capped at 60 fps and sending 60 fps, the difference from the built-in output is small; it shows when you lower the send rate, use camera outputs, or run uncapped.
+PresentMon、fps 制限なし、ウィンドウ表示。CPU Busy は 1 フレームあたりの CPU の処理時間。
+
+| 状態 / State | fps | CPU Busy | GPU Busy |
+|---|---|---|---|
+| 内蔵 NDI オン / Built-in NDI on（空のシーン / empty scene） | 約 570 | 1.66 ms | 0.56 ms |
+| 内蔵 NDI オフ / Built-in NDI off（空のシーン / empty scene） | 約 1200 | 0.52 ms | 0.41 ms |
+| このプラグイン MOD 版 / This plugin, MOD（ステージのシーン / stage scene） | 1099 | 0.56 ms | 0.55 ms |
 
 ## ~~正直なところ / To be honest~~
 
@@ -63,18 +95,8 @@ The built-in behaviour above was confirmed in Warudo Pro 0.15.1's code and its b
 The built-in output is heavy because it reads back and sends every rendered frame; with a capped frame rate that is only about 60 times a second anyway.
 The difference only shows when Warudo runs uncapped at hundreds of fps or more. This plugin is mostly for my own satisfaction.~~
 
-→ メイン出力を 60fps で送るだけなら今もこのとおりですが、送信 fps を下げる使い方とカメラごとの出力では、fps を固定していても差が出ます（上の「便利なところ」）。
+→ メイン出力を 60fps で送るだけなら今もこのとおりですが、送信 fps を下げる使い方とカメラごとの出力では、fps を固定していても差が出ます（上の「使いどころ」）。
 → This still holds for a single 60 fps main output, but lowering the send rate and per-camera outputs make a difference even with a capped frame rate (see above).
-
-## 計測 / Measurements
-
-PresentMon、fps 制限なし、ウィンドウ表示。CPU Busy は 1 フレームあたりの CPU の処理時間。
-
-| 状態 / State | fps | CPU Busy | GPU Busy |
-|---|---|---|---|
-| 内蔵 NDI オン / Built-in NDI on（空のシーン / empty scene） | 約 570 | 1.66 ms | 0.56 ms |
-| 内蔵 NDI オフ / Built-in NDI off（空のシーン / empty scene） | 約 1200 | 0.52 ms | 0.41 ms |
-| このプラグイン MOD 版 / This plugin, MOD（ステージのシーン / stage scene） | 1099 | 0.56 ms | 0.55 ms |
 
 ## 中身 / Contents
 
